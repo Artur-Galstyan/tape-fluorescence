@@ -1,0 +1,19 @@
+[project]
+name = "tape-fluorescence"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "coolname>=3.0.0",
+    "equinox>=0.13.4",
+    "fire>=0.7.1",
+    "grain>=0.2.15",
+    "jax[cuda13]>=0.9.0",
+    "lmdb>=1.7.5",
+    "matplotlib>=3.10.8",
+    "mlflow>=3.9.0",
+    "optax>=0.2.6",
+    "scipy>=1.17.0",
+    "tqdm>=4.67.2",
+]
