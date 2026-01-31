@@ -9,13 +9,16 @@ import equinox as eqx
 import grain.python as grain
 import jax
 import jax.numpy as jnp
+import jax.sharding as jshard
 import lmdb
 import mlflow
 import numpy as np
 import optax
 from beartype.typing import SupportsIndex
 from fire import Fire
+from jaxonlayers.layers import TransformerEncoder
 from jaxtyping import Array, Int, PRNGKeyArray, PyTree
+from pydantic import BaseModel
 from scipy.stats import spearmanr
 from tqdm import tqdm
 
@@ -162,27 +165,44 @@ def create_dataloader(
 
 class Model(eqx.Module):
     embedding: eqx.nn.Embedding
+    encoder: TransformerEncoder
     conv1: eqx.nn.Conv1d
     conv2: eqx.nn.Conv1d
     mlp: eqx.nn.MLP
     pad_idx: int
 
+    inference: bool
+
     def __init__(
-        self, vocab_size: int, max_len: int, pad_idx: int, *, key: PRNGKeyArray
+        self,
+        vocab_size: int,
+        max_len: int,
+        pad_idx: int,
+        emb_size: int = 128,
+        *,
+        key: PRNGKeyArray,
+        inference: bool = False,
     ):
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        self.encoder = TransformerEncoder(d_model=emb_size, n_heads=4, key=k1)
         self.pad_idx = pad_idx
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-        self.embedding = eqx.nn.Embedding(vocab_size, 128, key=k1)
+        self.embedding = eqx.nn.Embedding(vocab_size, emb_size, key=k2)
 
-        self.conv1 = eqx.nn.Conv1d(128, 256, kernel_size=5, padding=2, key=k2)
-        self.conv2 = eqx.nn.Conv1d(256, 512, kernel_size=5, padding=2, key=k3)
+        self.conv1 = eqx.nn.Conv1d(128, 256, kernel_size=5, padding=2, key=k3)
+        self.conv2 = eqx.nn.Conv1d(256, 512, kernel_size=5, padding=2, key=k4)
 
-        self.mlp = eqx.nn.MLP(512, 1, width_size=128, depth=2, key=k4)
+        self.mlp = eqx.nn.MLP(512, 1, width_size=128, depth=2, key=k5)
+        self.inference = inference
 
-    def __call__(self, x: Int[Array, "max_protein_length"]):
+    def __call__(
+        self, x: Int[Array, "max_protein_length"], key: PRNGKeyArray | None = None
+    ):
+        print("MODEL JIT")
+        if not self.inference:
+            assert key is not None
         mask = (x != self.pad_idx).astype(jnp.float32)[:, None]
         x = eqx.filter_vmap(self.embedding)(x)  # (L, emb_size)
-
+        x = self.encoder(x, key=key)
         x = jnp.transpose(x)  # (128, L)
 
         x = jax.nn.relu(self.conv1(x))
@@ -194,20 +214,21 @@ class Model(eqx.Module):
 
 
 @eqx.filter_jit
-def loss_fn(model: PyTree, X: tuple[Array, ...], y: Array):
-    preds = eqx.filter_vmap(model)(X)
+def loss_fn(model: PyTree, X: tuple[Array, ...], y: Array, key):
+    keys = jax.random.split(key, len(y))
+    preds = eqx.filter_vmap(model)(X, keys)
     return jnp.mean(optax.l2_loss(preds, y))
 
 
 def evaluate(model: PyTree, loader: grain.DataLoader):
     all_preds = []
     all_targets = []
-
+    inference_model = eqx.filter_jit(eqx.filter_vmap(eqx.nn.inference_mode(model)))
     for batch in loader:
         tokens = jnp.array(batch["tokens"])
         log_fluorescences = jnp.array(batch["log_fluorescence"])
 
-        preds = eqx.filter_vmap(model)(tokens)
+        preds = inference_model(tokens)
 
         all_preds.append(np.array(preds))
         all_targets.append(np.array(log_fluorescences))
@@ -222,21 +243,37 @@ def evaluate(model: PyTree, loader: grain.DataLoader):
     return mse, rho
 
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def step_fn(
     model: PyTree,
     X: tuple[Array, ...],
     y: Array,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
+    key: PRNGKeyArray,
 ):
-    value, grads = eqx.filter_value_and_grad(loss_fn)(model, X, y)
+    value, grads = eqx.filter_value_and_grad(loss_fn)(model, X, y, key)
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
     return model, opt_state, value
 
 
+class TrainConfig(BaseModel):
+    max_protein_length: int
+    batch_size: int
+    learning_rate: float
+    num_epochs: int
+    warmup_steps: int
+
+
 def main():
+    # num_devices = 1
+    num_devices = len(jax.devices())
+    # Use Auto axis type to maintain compatibility with eqx.filter_shard / with_sharding_constraint
+    mesh = jax.make_mesh((num_devices,), ("batch",), axis_types=(jshard.AxisType.Auto,))
+    data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("batch"))
+    model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
+
     setup_mlflow()
 
     data_dir = "data/fluorescence"
@@ -253,43 +290,71 @@ def main():
     model_name = coolname.generate_slug(3)
     assert model_name is not None
     print(f"{model_name=}")
+
     vocab = {aa: i for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}
-    max_protein_length = 256
-    batch_size = 1024
-    learning_rate = 3e-4
-    num_epochs = 10
+
+    train_config = TrainConfig(
+        max_protein_length=256,
+        batch_size=256,
+        learning_rate=3e-4,
+        num_epochs=30,
+        warmup_steps=200,
+    )
+
     train_loader, train_data_length = create_dataloader(
         lmdb_path="data/fluorescence/fluorescence_train.lmdb",
-        batch_size=batch_size,
-        max_protein_length=max_protein_length,
+        batch_size=train_config.batch_size,
+        max_protein_length=train_config.max_protein_length,
         shuffle=True,
-        num_epochs=num_epochs,
-        num_workers=0,
+        num_epochs=train_config.num_epochs,
+        num_workers=24,
         vocab=vocab,
     )
 
-    steps_per_epoch = train_data_length // batch_size
+    steps_per_epoch = train_data_length // train_config.batch_size
+
     model = Model(
-        len(vocab), max_protein_length, pad_idx=len(vocab), key=jax.random.key(22)
+        len(vocab),
+        train_config.max_protein_length,
+        pad_idx=len(vocab),
+        key=jax.random.key(22),
     )
-    optimiser = optax.adamw(learning_rate=learning_rate)
+
+    scheduler = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=train_config.learning_rate,
+        warmup_steps=1 * steps_per_epoch,
+        decay_steps=train_config.num_epochs * steps_per_epoch,
+        end_value=train_config.learning_rate * 0.01,
+    )
+
+    optimiser = optax.adamw(learning_rate=scheduler)
     opt_state = optimiser.init(eqx.filter(model, eqx.is_array))
 
+    model, opt_state = eqx.filter_shard((model, opt_state), model_sharding)
+    key = jax.random.key(0)
     with mlflow.start_run(run_name=model_name):
+        mlflow.log_params(train_config.model_dump())
+
         for step, batch in tqdm(enumerate(train_loader)):
             tokens = jnp.array(batch["tokens"])
             num_mutations = batch["num_mutations"]
             log_fluorescences = jnp.array(batch["log_fluorescence"])
-            model, opt_state, loss = step_fn(
-                model, tokens, log_fluorescences, optimiser, opt_state
-            )
+
+            current_lr = scheduler(step)
+            mlflow.log_metric("learning_rate", current_lr.item(), step=step)
+
+            key, subkey = jax.random.split(key)
+            X, y = eqx.filter_shard((tokens, log_fluorescences), data_sharding)
+
+            model, opt_state, loss = step_fn(model, X, y, optimiser, opt_state, subkey)
             loss_val = loss.item()
             mlflow.log_metric("train_loss", loss_val, step=step)
             if step % steps_per_epoch == 0:
                 test_loader, _ = create_dataloader(
                     lmdb_path="data/fluorescence/fluorescence_test.lmdb",
-                    batch_size=batch_size,
-                    max_protein_length=max_protein_length,
+                    batch_size=train_config.batch_size,
+                    max_protein_length=train_config.max_protein_length,
                     shuffle=False,
                     num_epochs=1,
                     num_workers=0,
@@ -297,8 +362,8 @@ def main():
                 )
                 valid_loader, _ = create_dataloader(
                     lmdb_path="data/fluorescence/fluorescence_valid.lmdb",
-                    batch_size=batch_size,
-                    max_protein_length=max_protein_length,
+                    batch_size=train_config.batch_size,
+                    max_protein_length=train_config.max_protein_length,
                     shuffle=False,
                     num_epochs=1,
                     num_workers=0,
